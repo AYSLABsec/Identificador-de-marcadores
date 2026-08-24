@@ -18,6 +18,7 @@ def norm_text(value):
     s = str(value).strip().lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.replace("β", "beta")
     s = re.sub(r"[^a-z0-9+./ -]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -32,17 +33,21 @@ def split_items(value):
 @st.cache_data(show_spinner=False)
 def load_book(path_str):
     path = Path(path_str)
+    xls = pd.ExcelFile(path)
     base = pd.read_excel(path, sheet_name="Base_maestra")
     primers = pd.read_excel(path, sheet_name="Catalogo_partidores")
     allowed = pd.read_excel(path, sheet_name="Marcadores_permitidos")
     rules = pd.read_excel(path, sheet_name="Reglas_familia")
     qa = pd.read_excel(path, sheet_name="QA")
-    return base, primers, allowed, rules, qa
-
-
-def make_search_blob(row):
-    fields = ["Grupo", "Clado", "Clase", "Orden", "Familia", "Genero", "Especie", "Sinonimia"]
-    return " | ".join(norm_text(row.get(c, "")) for c in fields)
+    if "Compatibilidad_taxon_primer" in xls.sheet_names:
+        compat = pd.read_excel(path, sheet_name="Compatibilidad_taxon_primer")
+    else:
+        compat = pd.DataFrame()
+    if "Cobertura_especie_marcador" in xls.sheet_names:
+        coverage = pd.read_excel(path, sheet_name="Cobertura_especie_marcador")
+    else:
+        coverage = pd.DataFrame()
+    return base, primers, allowed, rules, qa, compat, coverage
 
 
 def score_row(row, query):
@@ -59,19 +64,16 @@ def score_row(row, query):
         val = norm_text(row.get(field, ""))
         if not val:
             continue
-        # Exact taxon mention in free text.
         if val in q:
             score += weight
             reasons.append(f"{field}: {row.get(field)}")
             continue
-        # Synonym cell may contain slash-separated names.
         if field == "Sinonimia":
             for syn in re.split(r"\s*/\s*|\s*;\s*", val):
                 if len(syn) >= 5 and syn in q:
                     score += weight
                     reasons.append(f"Sinonimia: {syn}")
                     break
-        # Conservative fuzzy match only for taxonomic words present in query.
         if field in {"Especie", "Genero", "Familia", "Orden"}:
             tokens = [t for t in re.split(r"\W+", q) if len(t) >= 5]
             val_tokens = [t for t in re.split(r"\W+", val) if len(t) >= 5]
@@ -103,44 +105,6 @@ def rank_candidates(base, query, filters):
     return out
 
 
-def panel_applicability(panel_row, taxon_row, allowed_markers):
-    marker = norm_text(panel_row.get("Marcador_autorizado", ""))
-    if not any(norm_text(m) in marker or marker in norm_text(m) for m in allowed_markers if norm_text(m)):
-        return None
-
-    scope = norm_text(str(panel_row.get("Alcance", "")) + " " + str(panel_row.get("Nivel_objetivo", "")))
-    family = norm_text(taxon_row.get("Familia", ""))
-    genus = norm_text(taxon_row.get("Genero", ""))
-    order = norm_text(taxon_row.get("Orden", ""))
-    clade = norm_text(taxon_row.get("Clado", ""))
-    group = norm_text(taxon_row.get("Grupo", ""))
-
-    for label, val in [("género", genus), ("familia", family), ("orden", order), ("clado", clade)]:
-        if val and val in scope:
-            return f"Dirigido al {label}"
-
-    # Generic panels can be shown, but never as family-specific validation.
-    bacterial_generic = group.startswith("bacter") and any(x in scope for x in ["bacter", "universal"])
-    fungal_generic = (group.startswith("hongo") or group.startswith("levadura")) and any(x in scope for x in ["fung", "hongo", "levadura", "universal"])
-    archaea_generic = group.startswith("arque") and any(x in scope for x in ["archaea", "arque"])
-    if bacterial_generic or fungal_generic or archaea_generic:
-        return "Panel general del grupo; validar cobertura"
-
-    # Avoid borrowing a panel explicitly named for another family/genus.
-    return None
-
-
-def get_primer_panels(primers, taxon_row):
-    markers = split_items(taxon_row.get("Marcadores_normalizados", ""))
-    rows = []
-    for panel_id, grp in primers.groupby("Panel_ID", dropna=False):
-        first = grp.iloc[0]
-        applicability = panel_applicability(first, taxon_row, markers)
-        if applicability:
-            rows.append((str(panel_id), applicability, grp.copy()))
-    return rows
-
-
 def confidence_label(cands, query):
     if cands.empty:
         return "Sin coincidencia", "No se encontró un taxón del catálogo a partir de las pistas disponibles."
@@ -152,6 +116,59 @@ def confidence_label(cands, query):
     if top >= 50:
         return "Media", "La descripción apunta al menos a género/familia, pero requiere confirmación."
     return "Baja", "La coincidencia es amplia; revise los candidatos antes de elegir un flujo molecular."
+
+
+def get_compat_for_row(compat, taxon_row):
+    if compat.empty:
+        return pd.DataFrame()
+    ident = taxon_row.get("ID", None)
+    species = str(taxon_row.get("Especie", ""))
+    if "ID" in compat.columns and pd.notna(ident):
+        out = compat[compat["ID"].astype(str) == str(ident)].copy()
+    else:
+        out = compat[compat["Especie"].astype(str) == species].copy()
+    if out.empty:
+        return out
+    if "Prioridad" in out.columns:
+        out["Prioridad_sort"] = pd.to_numeric(out["Prioridad"], errors="coerce").fillna(99)
+    else:
+        out["Prioridad_sort"] = 99
+    out = out.sort_values(["Tipo_recomendacion", "Marcador", "Prioridad_sort", "Panel_ID"])
+    return out
+
+
+def display_marker_block(marker, rows, expanded=True):
+    rows = rows.copy()
+    valid = rows[rows["Panel_ID"].astype(str) != "SIN_PANEL_VALIDADO"].copy()
+    if valid.empty:
+        first = rows.iloc[0]
+        st.warning(f"{marker}: marcador recomendado/autorizado, pero sin panel validado en el catálogo.")
+        if pd.notna(first.get("Motivo", None)):
+            st.caption(str(first.get("Motivo")))
+        return
+    # Show all compatible panels, best first.
+    for _, r in valid.iterrows():
+        pid = r.get("Panel_ID", "")
+        title = f"{marker} → {pid} · prioridad {int(r['Prioridad_sort']) if pd.notna(r['Prioridad_sort']) else '—'} · {r.get('Nivel_compatibilidad','')}"
+        with st.expander(title, expanded=expanded):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.write(f"**Estado:** {r.get('Estado','—')}")
+                st.write(f"**Amplicón:** {r.get('Amplicon_reportado','—')}")
+                st.write(f"**Motivo:** {r.get('Motivo','—')}")
+            with c2:
+                primer_table = pd.DataFrame([
+                    {"Primer": r.get("Primer_F", ""), "Dirección": "F", "Secuencia 5′→3′": r.get("Secuencia_F_5_a_3", "")},
+                    {"Primer": r.get("Primer_R", ""), "Dirección": "R", "Secuencia 5′→3′": r.get("Secuencia_R_5_a_3", "")},
+                ])
+                st.dataframe(primer_table, use_container_width=True, hide_index=True)
+            ref = r.get("Referencia", "")
+            url = r.get("URL_fuente", "")
+            if pd.notna(ref) and str(ref).strip():
+                st.write(f"**Fuente:** {ref}")
+            if pd.notna(url) and str(url).strip():
+                st.link_button("Abrir fuente", str(url))
+            st.caption("La compatibilidad indica que el panel aplica según la base; aun así, la compra debe pasar por validación in silico/experimental.")
 
 
 st.title("🧬 Asistente de decisión molecular para microorganismos")
@@ -168,7 +185,7 @@ with st.sidebar:
         db_path = DEFAULT_DB
 
 try:
-    base, primers, allowed, rules, qa = load_book(str(db_path))
+    base, primers, allowed, rules, qa, compat, coverage = load_book(str(db_path))
 except Exception as exc:
     st.error(f"No se pudo cargar la base maestra: {exc}")
     st.stop()
@@ -176,6 +193,8 @@ except Exception as exc:
 with st.sidebar:
     st.success(f"{len(base)} microorganismos cargados")
     st.caption(f"{base['Orden'].nunique()} órdenes · {base['Familia'].nunique()} familias")
+    if not compat.empty:
+        st.caption(f"{compat['Panel_ID'].nunique()} paneles relacionados en compatibilidad")
     st.divider()
     st.subheader("Filtros opcionales")
     group_opts = ["Todos"] + sorted(base["Grupo"].dropna().astype(str).unique().tolist())
@@ -193,7 +212,7 @@ with st.sidebar:
 st.subheader("1. Describe el microorganismo sospechoso")
 query = st.text_area(
     "Puedes incluir nombre sospechoso, género, familia u otras observaciones.",
-    placeholder="Ej.: aislado bacteriano; sospecha de Pseudomonas fluorescens...",
+    placeholder="Ej.: aislado bacteriano; sospecha de Rhizobium leguminosarum...",
     height=120,
 )
 
@@ -243,7 +262,7 @@ with right:
         st.markdown(f"**Paso 1:** {p1}")
     if pd.notna(p2) and str(p2).strip():
         st.markdown(f"**Paso 2:** {p2}")
-    if (pd.isna(p2) or not str(p2).strip()):
+    if pd.isna(p2) or not str(p2).strip():
         st.caption("La base original no define un segundo paso para esta entrada.")
 
 st.markdown("#### Marcadores normalizados autorizados")
@@ -253,25 +272,37 @@ if marker_list:
 else:
     st.write("—")
 
-st.subheader("5. Primers concretos disponibles en el catálogo")
-panels = get_primer_panels(primers, row)
-if not panels:
-    st.warning("No hay un par de primers con secuencia que pueda asignarse de forma segura a este taxón usando las reglas actuales. No se propone una secuencia por analogía.")
+adds = split_items(row.get("Marcadores_adicionales_por_taxon", ""))
+if adds:
+    st.markdown("#### Opciones adicionales autorizadas por taxón")
+    st.write(" · ".join(f"`{m}`" for m in adds))
+    st.caption("Estos marcadores estaban permitidos en el Excel original, pero se agregan como opción por compatibilidad taxonómica; no reemplazan la recomendación literal original.")
+
+st.subheader("5. Cobertura marcador → primer")
+row_compat = get_compat_for_row(compat, row)
+if row_compat.empty:
+    st.warning("La base no contiene una tabla Compatibilidad_taxon_primer. Actualiza a la Base Maestra V3 para evitar omisiones.")
 else:
-    for panel_id, applicability, grp in panels:
-        with st.expander(f"{panel_id} — {applicability}", expanded=True):
-            st.write(f"**Marcador:** {grp.iloc[0]['Marcador_autorizado']}")
-            st.write(f"**Alcance publicado:** {grp.iloc[0]['Alcance']}")
-            st.write(f"**Estado:** {grp.iloc[0]['Estado_validacion_catalogo']}")
-            primer_table = grp[["Primer", "Direccion", "Secuencia_5_a_3", "Pareja_mezcla", "Amplicon_reportado"]].copy()
-            st.dataframe(primer_table, use_container_width=True, hide_index=True)
-            ref = grp.iloc[0].get("Referencia", "")
-            url = grp.iloc[0].get("URL_fuente", "")
-            if pd.notna(ref) and str(ref).strip():
-                st.write(f"**Fuente:** {ref}")
-            if pd.notna(url) and str(url).strip():
-                st.link_button("Abrir fuente", str(url))
-            st.caption("La presencia de una secuencia publicada no demuestra por sí sola cobertura de todas las especies de la familia; revise el estado de validación.")
+    original = row_compat[row_compat["Tipo_recomendacion"].astype(str) == "Original del Excel"].copy()
+    additional = row_compat[row_compat["Tipo_recomendacion"].astype(str) == "Adicional por taxón"].copy()
+
+    st.markdown("### 5.1 Marcadores originales")
+    if original.empty:
+        st.info("No hay marcadores originales normalizados para esta entrada.")
+    else:
+        for marker in original["Marcador"].drop_duplicates().tolist():
+            display_marker_block(marker, original[original["Marcador"] == marker], expanded=True)
+
+    st.markdown("### 5.2 Opciones adicionales por taxón")
+    if additional.empty:
+        st.caption("No hay marcadores adicionales por taxón para este microorganismo.")
+    else:
+        for marker in additional["Marcador"].drop_duplicates().tolist():
+            display_marker_block(marker, additional[additional["Marcador"] == marker], expanded=False)
+
+    st.markdown("### 5.3 Tabla de compatibilidad completa")
+    cols = ["Marcador", "Tipo_recomendacion", "Panel_ID", "Prioridad", "Nivel_compatibilidad", "Estado", "Amplicon_reportado"]
+    st.dataframe(row_compat[cols], use_container_width=True, hide_index=True)
 
 st.subheader("6. Trazabilidad y salida")
 source_tax = row.get("Fuente_taxonomica", "")
@@ -283,15 +314,17 @@ report_lines = [
     f"Grupo: {row.get('Grupo','')}", f"Clado: {row.get('Clado','')}", f"Clase: {row.get('Clase','')}",
     f"Orden: {row.get('Orden','')}", f"Familia: {row.get('Familia','')}", f"Género: {row.get('Genero','')}",
     f"Marcadores originales: {row.get('Marcadores_originales','')}",
+    f"Marcadores adicionales por taxón: {row.get('Marcadores_adicionales_por_taxon','')}",
     f"Paso 1: {row.get('Paso_1_original','')}", f"Paso 2: {row.get('Paso_2_original','')}",
 ]
-if panels:
-    report_lines.append("Paneles con secuencia disponibles:")
-    for pid, applicability, grp in panels:
-        report_lines.append(f"- {pid} ({applicability})")
-        for _, pr in grp.iterrows():
-            report_lines.append(f"  {pr['Primer']} [{pr['Direccion']}]: {pr['Secuencia_5_a_3']}")
-        report_lines.append(f"  Fuente: {grp.iloc[0].get('URL_fuente','')}")
+if not row_compat.empty:
+    report_lines.append("Compatibilidad marcador-primer:")
+    for _, r in row_compat.iterrows():
+        report_lines.append(f"- {r['Marcador']} [{r['Tipo_recomendacion']}]: {r['Panel_ID']} prioridad {r.get('Prioridad','')}")
+        if str(r.get('Panel_ID','')) != 'SIN_PANEL_VALIDADO':
+            report_lines.append(f"  F {r.get('Primer_F','')}: {r.get('Secuencia_F_5_a_3','')}")
+            report_lines.append(f"  R {r.get('Primer_R','')}: {r.get('Secuencia_R_5_a_3','')}")
+            report_lines.append(f"  Fuente: {r.get('URL_fuente','')}")
 report = "\n".join(report_lines)
 st.download_button("Descargar resumen (.txt)", report, file_name="flujo_molecular.txt", mime="text/plain")
 
