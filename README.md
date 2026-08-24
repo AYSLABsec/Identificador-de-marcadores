@@ -17,7 +17,7 @@ Prototipo que utiliza `base_maestra.xlsx` como única autoridad para taxonomía,
 
 ```bash
 python -m pip install -r requirements.txt
-streamlit run app.py
+streamlit run Identificador_Marcadores.py
 ```
 
 La aplicación espera que `base_maestra.xlsx` esté en la misma carpeta. También permite cargar otra versión compatible desde la barra lateral.
