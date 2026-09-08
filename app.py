@@ -1133,6 +1133,273 @@ def dataframe_to_xlsx_bytes(df, sheet_name="Validacion_paneles"):
     return bio.getvalue()
 
 
+def build_primer_validation_pdf(taxon_row, summary_df, result_records, analysis_params):
+    """Generate a presentation-ready technical report from a completed batch run."""
+    import html
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        KeepTogether, HRFlowable,
+    )
+    from reportlab.graphics.shapes import Drawing, Rect, String, Line, Polygon
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.graphics.charts.textlabels import Label
+
+    def clean(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "-"
+        value = str(value).strip()
+        if not value or value.lower() in {"nan", "none"}:
+            return "-"
+        for old, new in {"→":"->", "≥":">=", "≤":"<=", "′":"'", "–":"-", "—":"-",
+                         "⚠️":"", "⚠":"", "✓":"Si", "🇨🇱":"SAG", "🧪":""}.items():
+            value = value.replace(old, new)
+        return value
+
+    def esc(value):
+        return html.escape(clean(value))
+
+    navy, blue = colors.HexColor("#17324D"), colors.HexColor("#2878A8")
+    teal, dark = colors.HexColor("#2A8C82"), colors.HexColor("#263746")
+    light, mid = colors.HexColor("#F5F7F9"), colors.HexColor("#D6DEE5")
+    pale_blue, amber = colors.HexColor("#EAF3F8"), colors.HexColor("#D89B2B")
+    pale_amber = colors.HexColor("#FFF4D6")
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="RptTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+                              fontSize=21, leading=26, textColor=navy, alignment=TA_CENTER, spaceAfter=8))
+    styles.add(ParagraphStyle(name="RptSub", parent=styles["Normal"], fontSize=10.5, leading=14,
+                              textColor=dark, alignment=TA_CENTER, spaceAfter=12))
+    styles.add(ParagraphStyle(name="RptH1", parent=styles["Heading1"], fontName="Helvetica-Bold",
+                              fontSize=14, leading=18, textColor=navy, spaceBefore=8, spaceAfter=7))
+    styles.add(ParagraphStyle(name="RptH2", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                              fontSize=11, leading=14, textColor=blue, spaceBefore=6, spaceAfter=4))
+    styles.add(ParagraphStyle(name="RptBody", parent=styles["BodyText"], fontSize=8.5, leading=11.5,
+                              textColor=dark, spaceAfter=5))
+    styles.add(ParagraphStyle(name="RptSmall", parent=styles["BodyText"], fontSize=7.2, leading=9.2, textColor=dark))
+    styles.add(ParagraphStyle(name="RptTiny", parent=styles["BodyText"], fontSize=6.1, leading=7.5, textColor=dark))
+    styles.add(ParagraphStyle(name="RptCallout", parent=styles["BodyText"], fontSize=9, leading=12,
+                              textColor=navy, backColor=pale_blue, borderColor=blue, borderWidth=.7,
+                              borderPadding=7, spaceAfter=8))
+    styles.add(ParagraphStyle(name="RptWarn", parent=styles["BodyText"], fontSize=8.5, leading=11.5,
+                              textColor=colors.HexColor("#684800"), backColor=pale_amber,
+                              borderColor=amber, borderWidth=.7, borderPadding=7, spaceAfter=8))
+
+    bio = BytesIO()
+    doc = SimpleDocTemplate(bio, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm,
+                            topMargin=18*mm, bottomMargin=16*mm,
+                            title=f"Informe de primers - {clean(taxon_row.get('Especie'))}",
+                            author="Asistente molecular Nanopore")
+
+    def decorate(canvas, document):
+        canvas.saveState()
+        width, height = A4
+        canvas.setStrokeColor(mid); canvas.line(15*mm, height-12*mm, width-15*mm, height-12*mm)
+        canvas.setFont("Helvetica", 7); canvas.setFillColor(colors.HexColor("#607080"))
+        canvas.drawString(15*mm, 9*mm, "Asistente molecular Nanopore - Informe tecnico de primers")
+        canvas.drawRightString(width-15*mm, 9*mm, f"Pagina {document.page}")
+        canvas.restoreState()
+
+    story = []
+    species = clean(taxon_row.get("Especie", "Taxon no especificado"))
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    story += [Spacer(1, 7*mm), Paragraph("INFORME TECNICO", styles["RptSub"]),
+              Paragraph("Validacion y seleccion de sets de primers", styles["RptTitle"]),
+              Paragraph(f"Taxon: <b><i>{esc(species)}</i></b><br/>Generado: {generated}", styles["RptSub"]),
+              HRFlowable(width="100%", thickness=1.4, color=blue, spaceAfter=12)]
+
+    tax_rows = [
+        ["Grupo", taxon_row.get("Grupo"), "Clado", taxon_row.get("Clado")],
+        ["Orden", taxon_row.get("Orden"), "Familia", taxon_row.get("Familia")],
+        ["Genero", taxon_row.get("Genero"), "Dificultad", taxon_row.get("Dificultad_identificacion", "Estandar")],
+    ]
+    tax_table = Table([[Paragraph(f"<b>{esc(v)}</b>", styles["RptSmall"]) if i % 2 == 0 else Paragraph(esc(v), styles["RptSmall"])
+                        for i,v in enumerate(r)] for r in tax_rows], colWidths=[24*mm,57*mm,24*mm,57*mm])
+    tax_table.setStyle(TableStyle([("BACKGROUND",(0,0),(0,-1),pale_blue), ("BACKGROUND",(2,0),(2,-1),pale_blue),
+                                   ("GRID",(0,0),(-1,-1),.35,mid), ("VALIGN",(0,0),(-1,-1),"TOP"),
+                                   ("PADDING",(0,0),(-1,-1),5)]))
+    story += [tax_table, Spacer(1,5*mm)]
+
+    df = summary_df.copy()
+    df["_cov"] = pd.to_numeric(df.get("Cobertura (%)", pd.Series(index=df.index, dtype=float)), errors="coerce")
+    df["_lab"] = (df["En laboratorio"].astype(str) == "Sí").astype(int) if "En laboratorio" in df else 0
+    df["_sag"] = (df["SAG"].astype(str) == "Sí").astype(int) if "SAG" in df else 0
+    ranked = df.sort_values(["_cov","_lab","_sag"], ascending=[False,False,False], na_position="last")
+    valid = ranked[ranked["_cov"].notna()]
+    coverage_best = valid.iloc[0] if not valid.empty else None
+    difficulty = clean(taxon_row.get("Dificultad_identificacion", "Estandar"))
+    broad_marker_pattern = r"(?:^|[^A-Z0-9])(?:16S|18S|ITS|28S|LSU|SSU)(?:[^A-Z0-9]|$)"
+    informative = valid[
+        ~valid["Marcador"].astype(str).str.upper().str.contains(broad_marker_pattern, regex=True, na=False)
+    ] if not valid.empty else valid
+    if difficulty in {"Alta", "Muy alta"} and not informative.empty:
+        best = informative.iloc[0]
+    else:
+        best = coverage_best if coverage_best is not None else (ranked.iloc[0] if not ranked.empty else None)
+    high_cov = int((df["_cov"] >= 95).sum())
+    lab_count = int(df["_lab"].sum())
+
+    story.append(Paragraph("Resumen ejecutivo", styles["RptH1"]))
+    if coverage_best is not None:
+        text = (f"Se evaluaron <b>{len(df)} sets</b>. La mayor cobertura interpretable fue "
+                f"<b>{float(coverage_best['_cov']):.1f}%</b> para <b>{esc(coverage_best.get('Panel'))}</b> "
+                f"({esc(coverage_best.get('Marcador'))}). Hubo {high_cov} paneles con cobertura >=95% y "
+                f"{lab_count} pares completos disponibles en el laboratorio.")
+        if best is not None and clean(best.get("Panel")) != clean(coverage_best.get("Panel")):
+            text += (f" Para la recomendacion se priorizo <b>{esc(best.get('Panel'))}</b> "
+                     f"({esc(best.get('Marcador'))}), porque un marcador universal con mayor cobertura puede carecer de resolucion a nivel de especie.")
+    else:
+        text = (f"Se evaluaron <b>{len(df)} sets</b>, pero no hubo un denominador de cobertura interpretable. "
+                "La seleccion debe basarse en pertinencia taxonomica, evidencia documental y validacion experimental.")
+    story.append(Paragraph(text, styles["RptCallout"]))
+    if difficulty in {"Alta", "Muy alta"}:
+        story.append(Paragraph(
+            f"Dificultad de identificacion: <b>{esc(difficulty)}</b>. Cobertura de amplificacion no equivale a discriminacion. "
+            "No confirmar especie con un unico top-hit o amplicon; usar loci complementarios y escalar a MLSA/WGS si persiste la ambiguedad.",
+            styles["RptWarn"]))
+
+    story.append(Paragraph("Parametros", styles["RptH2"]))
+    params = [["Alcance", analysis_params.get("scope")],
+              ["Rango de amplicon", f"{analysis_params.get('product_min')} - {analysis_params.get('product_max')} bp"],
+              ["Mismatches", f"{analysis_params.get('max_mismatches')} por primer"],
+              ["Motores", "BLAST corto (no degenerados) / matching IUPAC sobre referencias NCBI (degenerados)"],
+              ["Paneles", f"{len(df)} evaluados"]]
+    pt = Table([[Paragraph(f"<b>{esc(a)}</b>",styles["RptSmall"]),Paragraph(esc(b),styles["RptSmall"])] for a,b in params],
+               colWidths=[42*mm,120*mm])
+    pt.setStyle(TableStyle([("BACKGROUND",(0,0),(0,-1),light),("GRID",(0,0),(-1,-1),.35,mid),
+                            ("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),5)]))
+    story += [pt, Spacer(1,3*mm), Paragraph("Esquema de decision", styles["RptH2"])]
+
+    flow = Drawing(480,88)
+    boxes = [(3,45,96,30,"Evidencia documental"),(126,45,96,30,"Cobertura in silico"),
+             (249,45,96,30,"Inventario y PCR"),(372,45,104,30,"Decision integrada")]
+    for x,y,w,h,label in boxes:
+        flow.add(Rect(x,y,w,h,rx=5,ry=5,fillColor=pale_blue,strokeColor=blue,strokeWidth=1))
+        flow.add(String(x+w/2,y+12,label,fontName="Helvetica-Bold",fontSize=7.2,textAnchor="middle",fillColor=navy))
+    for x1,x2 in [(99,126),(222,249),(345,372)]:
+        flow.add(Line(x1,60,x2-5,60,strokeColor=teal,strokeWidth=1.4))
+        flow.add(Polygon(points=[x2-5,60,x2-11,64,x2-11,56],fillColor=teal,strokeColor=teal))
+    flow.add(String(240,17,"Cobertura y poder discriminatorio se evalúan como propiedades diferentes.",
+                    fontName="Helvetica-Oblique",fontSize=7.4,textAnchor="middle",fillColor=dark))
+    story += [flow, Paragraph("Comparacion de sets", styles["RptH1"])]
+
+    headers = ["Marcador","Panel","Motor","Cobertura","Producto","Lab","SAG","Estado"]
+    rows = [[Paragraph(f"<b>{h}</b>",styles["RptTiny"]) for h in headers]]
+    for _, rr in ranked.iterrows():
+        coverage = "-" if pd.isna(rr["_cov"]) else f"{float(rr['_cov']):.1f}%"
+        vals = [rr.get("Marcador"),rr.get("Panel"),rr.get("Motor"),coverage,rr.get("Producto observado"),
+                rr.get("En laboratorio"),rr.get("SAG"),rr.get("Estado")]
+        rows.append([Paragraph(esc(v),styles["RptTiny"]) for v in vals])
+    table = Table(rows,repeatRows=1,colWidths=[20*mm,31*mm,25*mm,16*mm,19*mm,10*mm,10*mm,31*mm])
+    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),navy),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+                               ("GRID",(0,0),(-1,-1),.3,mid),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,light]),
+                               ("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),3)]))
+    story += [table,Spacer(1,4*mm)]
+
+    if not valid.empty:
+        chart_df = valid.head(12).iloc[::-1]
+        chart = Drawing(480,180); bars = VerticalBarChart()
+        bars.x,bars.y,bars.height,bars.width = 48,44,112,405
+        bars.data = [chart_df["_cov"].astype(float).tolist()]
+        bars.categoryAxis.categoryNames = [clean(x)[:19] for x in chart_df["Panel"]]
+        bars.categoryAxis.labels.angle = 35; bars.categoryAxis.labels.fontSize = 5.5; bars.categoryAxis.labels.dy = -8
+        bars.valueAxis.valueMin=0; bars.valueAxis.valueMax=100; bars.valueAxis.valueStep=20; bars.valueAxis.labels.fontSize=7
+        bars.bars[0].fillColor=teal; bars.bars[0].strokeColor=teal; chart.add(bars)
+        label=Label(); label.setOrigin(14,108); label.angle=90; label.setText("Cobertura (%)"); label.fontSize=7; chart.add(label)
+        chart.add(String(250,170,"Denominador: especies/referencias evaluables",fontName="Helvetica-Oblique",
+                         fontSize=7,textAnchor="middle",fillColor=dark))
+        story.append(KeepTogether([Paragraph("Cobertura observada",styles["RptH2"]),chart,Spacer(1,2*mm)]))
+
+    story.append(Paragraph("Conclusiones y recomendaciones",styles["RptH1"]))
+    recs=[]
+    if best is not None and pd.notna(best.get("_cov")):
+        recs.append(f"Priorizar <b>{esc(best.get('Panel'))}</b> ({esc(best.get('Marcador'))}) como candidato de amplificacion: obtuvo {float(best['_cov']):.1f}% de cobertura interpretable.")
+        recs.append("El par principal esta completo en el inventario y puede pasar a PCR piloto." if best.get("En laboratorio")=="Sí"
+                    else "El par principal no aparece completo en el inventario; confirmar disponibilidad antes de la PCR.")
+        if best.get("SAG")=="Sí": recs.append("El candidato principal cuenta ademas con respaldo SAG para el contexto registrado.")
+    else:
+        recs.append("No se puede designar un ganador por cobertura; priorizar respaldo SAG/bibliografico y realizar PCR piloto comparativa.")
+    if difficulty in {"Alta","Muy alta"}:
+        secondary=None
+        if best is not None:
+            for _, cand in valid.iloc[1:].iterrows():
+                if clean(cand.get("Marcador")) != clean(best.get("Marcador")):
+                    secondary=cand; break
+        if secondary is not None:
+            recs.append(f"Complementar con <b>{esc(secondary.get('Panel'))}</b> ({esc(secondary.get('Marcador'))}; {float(secondary['_cov']):.1f}%) y analizar ambos loci en conjunto.")
+        else:
+            recs.append("No hay un segundo locus claramente evaluable. No confirmar especie con un unico amplicon; incorporar un marcador de refuerzo o escalar a MLSA/WGS.")
+    recs.append("Antes de secuenciar: exigir producto unico del tamaño esperado, controles positivo/negativo, purificacion y cuantificacion; no mezclar productos inespecificos ni cargas muy desbalanceadas.")
+    for i, rec in enumerate(recs,1): story.append(Paragraph(f"<b>{i}.</b> {rec}",styles["RptBody"]))
+    story.append(Paragraph(f"<b>Riesgo:</b> {esc(taxon_row.get('Riesgo_interpretacion'))}<br/><b>Escalamiento:</b> {esc(taxon_row.get('Escalamiento_recomendado'))}",styles["RptWarn"]))
+
+    story += [PageBreak(),Paragraph("Detalle tecnico por set",styles["RptH1"])]
+    for idx, (_, rr) in enumerate(ranked.iterrows(),1):
+        record=None
+        for item in (result_records or []):
+            p=item.get("panel",{})
+            if clean(p.get("panel") or p.get("label"))==clean(rr.get("Panel")) and clean(p.get("marker"))==clean(rr.get("Marcador")):
+                record=item; break
+        panel=record.get("panel",{}) if record else {}; result=record.get("result",{}) if record else {}
+        meta=record.get("meta",{}) if record else {}
+        seq_rows=[["Primer","Nombre","Secuencia 5'->3'","Degeneracion"],
+                  ["F",panel.get("primer_f",rr.get("Primer F")),panel.get("seq_f","-"),f"{primer_degeneracy(panel.get('seq_f',''))['variants']} variantes"],
+                  ["R",panel.get("primer_r",rr.get("Primer R")),panel.get("seq_r","-"),f"{primer_degeneracy(panel.get('seq_r',''))['variants']} variantes"]]
+        seq_table=Table([[Paragraph(f"<b>{esc(v)}</b>",styles["RptSmall"]) if r==0 else Paragraph(esc(v),styles["RptSmall"])
+                          for v in rowx] for r,rowx in enumerate(seq_rows)],colWidths=[13*mm,35*mm,91*mm,25*mm],repeatRows=1)
+        seq_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),pale_blue),("GRID",(0,0),(-1,-1),.35,mid),
+                                       ("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),4)]))
+        coverage="-" if pd.isna(rr["_cov"]) else f"{float(rr['_cov']):.1f}%"
+        details=[["Motor",rr.get("Motor"),"Cobertura",coverage],
+                 ["Especies cubiertas",rr.get("Especies cubiertas"),"Producto",rr.get("Producto observado")],
+                 ["Hits F/R",f"{rr.get('Hits F','-')} / {rr.get('Hits R','-')}","Productos compatibles",rr.get("Productos compatibles")],
+                 ["Laboratorio",rr.get("En laboratorio"),"SAG",rr.get("SAG")],
+                 ["Evidencia documental",rr.get("Evidencia documental"),"Valoracion global",rr.get("Valoración global")],
+                 ["Amplicon reportado",meta.get("amplicon",panel.get("amplicon","-")),"Tm F / Tm R",f"{fmt_temp(meta.get('tm_f'))} / {fmt_temp(meta.get('tm_r'))}"],
+                 ["Ta bibliografica",fmt_temp(meta.get("ta")),"Metodo Tm",meta.get("method","-")]]
+        dt=Table([[Paragraph(f"<b>{esc(v)}</b>",styles["RptTiny"]) if j%2==0 else Paragraph(esc(v),styles["RptTiny"])
+                   for j,v in enumerate(rowx)] for rowx in details],colWidths=[30*mm,52*mm,31*mm,51*mm])
+        dt.setStyle(TableStyle([("BACKGROUND",(0,0),(0,-1),light),("BACKGROUND",(2,0),(2,-1),light),
+                                ("GRID",(0,0),(-1,-1),.3,mid),("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),4)]))
+        block=[Paragraph(f"{idx}. {esc(rr.get('Panel'))} - {esc(rr.get('Marcador'))}",styles["RptH2"]),seq_table,Spacer(1,2*mm),dt,
+               Paragraph(f"<b>Interpretacion:</b> {esc(rr.get('Interpretación'))}",styles["RptBody"])]
+        reference = meta.get("reference") or meta.get("sag_ref")
+        source_url = meta.get("source_url") or meta.get("sag_url")
+        if reference != None or source_url != None:
+            block.append(Paragraph(
+                f"<b>Fuente:</b> {esc(reference)}<br/><b>URL:</b> {esc(source_url)}",
+                styles["RptSmall"],
+            ))
+        examples=result.get("paired_examples",[]) if result else []
+        if examples:
+            exrows=[["Especie","Accesion","Producto","Mismatches F/R"]]
+            for ex in examples[:5]: exrows.append([ex.get("species"),ex.get("accession"),f"{ex.get('product_bp')} bp",f"{ex.get('f_mismatches')}/{ex.get('r_mismatches')}"])
+            ext=Table([[Paragraph(f"<b>{esc(v)}</b>",styles["RptTiny"]) if r==0 else Paragraph(esc(v),styles["RptTiny"])
+                        for v in rowx] for r,rowx in enumerate(exrows)],colWidths=[53*mm,53*mm,26*mm,32*mm],repeatRows=1)
+            ext.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),navy),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+                                     ("GRID",(0,0),(-1,-1),.3,mid),("PADDING",(0,0),(-1,-1),3)]))
+            block += [Paragraph("Ejemplos compatibles",styles["RptSmall"]),ext]
+        story += [KeepTogether(block),Spacer(1,3*mm)]
+
+    story.append(Paragraph("Limitaciones",styles["RptH1"]))
+    limits=["La cobertura usa solo referencias evaluables y no necesariamente representa todo el taxon.",
+            "Referencias parciales pueden producir resultados no concluyentes.",
+            "El analisis in silico no modela completamente inhibidores, concentraciones ni estructura secundaria.",
+            "Amplificacion exitosa no demuestra resolucion entre especies cercanas.",
+            "NCBI depende de la calidad y representacion de las secuencias disponibles.",
+            "La decision final requiere PCR, electroforesis, controles y secuenciacion experimental."]
+    for item in limits: story.append(Paragraph(f"- {esc(item)}",styles["RptBody"]))
+    story.append(Paragraph("Trazabilidad",styles["RptH1"]))
+    story.append(Paragraph(f"Marcadores originales: {esc(taxon_row.get('Marcadores_originales'))}. Marcadores de refuerzo: {esc(taxon_row.get('Marcadores_refuerzo_dificultad'))}. Las referencias completas y enlaces permanecen disponibles en la interfaz.",styles["RptBody"]))
+    doc.build(story,onFirstPage=decorate,onLaterPages=decorate)
+    bio.seek(0)
+    return bio.getvalue()
+
+
 def render_validation_result(result, from_cache=False):
     if from_cache:
         st.success(f"Resultado recuperado de caché ({result.get('cache_age_days', 0):.1f} días).")
@@ -1977,9 +2244,22 @@ with tab3:
 
         st.markdown("### Validación masiva de paneles recomendados")
         st.caption(
-            "Ejecuta todos los pares F/R recomendados para el taxón seleccionado. Primero reutiliza la caché y solo consulta NCBI para los paneles pendientes. "
+            "Selecciona los pares F/R que deseas evaluar. Todos aparecen seleccionados por defecto y puedes quitar cualquiera antes de iniciar. "
+            "Primero se reutiliza la caché y solo se consulta NCBI para los paneles pendientes. "
             "Las consultas se ejecutan secuencialmente para no sobrecargar los servicios públicos de NCBI."
         )
+        batch_labels = [panel["label"] for panel in validation_choices]
+        selected_batch_labels = st.multiselect(
+            "Paneles incluidos en la validación masiva",
+            options=batch_labels,
+            default=batch_labels,
+            key=f"batch_selected_panels_{row.get('ID', 'taxon')}",
+            help="Todos están seleccionados inicialmente. Quita de la lista los paneles que no quieras validar.",
+        )
+        selected_batch_set = set(selected_batch_labels)
+        selected_batch_panels = [
+            panel for panel in validation_choices if panel["label"] in selected_batch_set
+        ]
         bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
         batch_scope = bc1.selectbox("Alcance masivo", ["Género", "Especie"], index=0, key="batch_scope")
         batch_product_min = bc2.number_input("Mínimo (bp)", min_value=20, max_value=50000, value=int(product_min), step=10, key="batch_min")
@@ -1987,17 +2267,33 @@ with tab3:
         batch_mm = bc4.number_input("Mismatches / primer", min_value=0, max_value=10, value=int(max_mm), step=1, key="batch_mm")
         if batch_product_max <= batch_product_min:
             st.error("El tamaño máximo de la validación masiva debe ser mayor que el mínimo.")
-        st.caption(f"Se evaluarán **{len(validation_choices)} panel(es) únicos**. Los primers degenerados usarán IUPAC automáticamente.")
+        st.caption(
+            f"Se evaluarán **{len(selected_batch_panels)} de {len(validation_choices)} panel(es) disponibles**. "
+            "Los primers degenerados usarán IUPAC automáticamente."
+        )
+        if not selected_batch_panels:
+            st.warning("Selecciona al menos un panel para ejecutar la validación masiva.")
 
         if "batch_validation_df" not in st.session_state:
             st.session_state.batch_validation_df = None
-        run_all = st.button("🧪 Validar TODOS los paneles recomendados", type="primary", use_container_width=True, key="run_all_panels")
-        if run_all and batch_product_max > batch_product_min:
+        if "batch_validation_records" not in st.session_state:
+            st.session_state.batch_validation_records = []
+        if "batch_validation_context" not in st.session_state:
+            st.session_state.batch_validation_context = None
+        run_selected = st.button(
+            "🧪 Validar paneles seleccionados",
+            type="primary",
+            use_container_width=True,
+            key="run_selected_panels",
+            disabled=not selected_batch_panels,
+        )
+        if run_selected and selected_batch_panels and batch_product_max > batch_product_min:
             rows_batch = []
+            records_batch = []
             progress = st.progress(0.0, text="Preparando validación masiva...")
             status_box = st.empty()
-            total = len(validation_choices)
-            for i, panel in enumerate(validation_choices, start=1):
+            total = len(selected_batch_panels)
+            for i, panel in enumerate(selected_batch_panels, start=1):
                 status_box.info(f"Panel {i}/{total}: {panel.get('label','')} · consultando caché/NCBI...")
                 try:
                     result_b, cached_b, engine_b = validate_one_panel(
@@ -2006,6 +2302,16 @@ with tab3:
                         cache_days=int(cache_days), force_refresh=False,
                     )
                     rows_batch.append(batch_summary_row(panel, result_b, engine_b, cached_b, primers, inv_seqs))
+                    records_batch.append({
+                        "panel": panel,
+                        "result": result_b,
+                        "engine": engine_b,
+                        "from_cache": cached_b,
+                        "meta": panel_meta_from_catalog(
+                            primers, panel.get("panel", ""), panel.get("primer_f", ""), panel.get("primer_r", ""),
+                            panel.get("seq_f", ""), panel.get("seq_r", ""),
+                        ),
+                    })
                 except Exception as exc:
                     rows_batch.append({
                         "Marcador": panel.get("marker", ""), "Panel": panel.get("panel", "") or panel.get("label", ""),
@@ -2016,6 +2322,16 @@ with tab3:
                         "En laboratorio": "Sí" if pair_in_lab(panel.get("seq_f", ""), panel.get("seq_r", ""), inv_seqs) else "No",
                         "Caché": "No", "Estado": "⚠️ Error", "Interpretación": str(exc)[:180],
                     })
+                    records_batch.append({
+                        "panel": panel,
+                        "result": {"interpretation_status": "error", "error": str(exc)},
+                        "engine": resolve_validation_engine(panel, "Automático"),
+                        "from_cache": False,
+                        "meta": panel_meta_from_catalog(
+                            primers, panel.get("panel", ""), panel.get("primer_f", ""), panel.get("primer_r", ""),
+                            panel.get("seq_f", ""), panel.get("seq_r", ""),
+                        ),
+                    })
                 progress.progress(i / total, text=f"Completados {i}/{total} paneles")
             status_box.empty()
             bdf = pd.DataFrame(rows_batch)
@@ -2024,6 +2340,16 @@ with tab3:
                 bdf["_sort_lab"] = (bdf["En laboratorio"] == "Sí").astype(int)
                 bdf = bdf.sort_values(["_sort_cov", "_sort_lab"], ascending=[False, False]).drop(columns=["_sort_cov", "_sort_lab"])
             st.session_state.batch_validation_df = bdf
+            st.session_state.batch_validation_records = records_batch
+            st.session_state.batch_validation_context = {
+                "taxon_id": str(row.get("ID", "")),
+                "scope": batch_scope,
+                "product_min": int(batch_product_min),
+                "product_max": int(batch_product_max),
+                "max_mismatches": int(batch_mm),
+                "panel_labels": [p.get("label", "") for p in selected_batch_panels],
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
             st.success("Validación masiva terminada. Los resultados quedaron guardados en caché panel por panel.")
 
         bdf = st.session_state.get("batch_validation_df")
@@ -2045,6 +2371,33 @@ with tab3:
             dl1.download_button("Descargar tabla CSV", csv_bytes, file_name=f"validacion_paneles_{norm_text(row.get('Especie','')).replace(' ','_')}.csv", mime="text/csv", use_container_width=True)
             xlsx_bytes = dataframe_to_xlsx_bytes(bdf)
             dl2.download_button("Descargar tabla Excel", xlsx_bytes, file_name=f"validacion_paneles_{norm_text(row.get('Especie','')).replace(' ','_')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+            report_context = st.session_state.get("batch_validation_context") or {}
+            same_taxon = report_context.get("taxon_id") == str(row.get("ID", ""))
+            if same_taxon:
+                try:
+                    pdf_bytes = build_primer_validation_pdf(
+                        row,
+                        bdf,
+                        st.session_state.get("batch_validation_records", []),
+                        report_context,
+                    )
+                    safe_species = norm_text(row.get("Especie", "taxon")).replace(" ", "_") or "taxon"
+                    st.download_button(
+                        "📄 Descargar informe técnico en PDF",
+                        pdf_bytes,
+                        file_name=f"informe_validacion_primers_{safe_species}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="download_batch_pdf",
+                    )
+                    st.caption("El informe incluye comparación, gráfico de cobertura, detalle de primers, conclusiones, recomendaciones y limitaciones.")
+                except ImportError:
+                    st.error("No se pudo generar el PDF porque falta la dependencia reportlab. Instálala con: pip install reportlab")
+                except Exception as exc:
+                    st.error(f"No se pudo generar el informe PDF: {exc}")
+            else:
+                st.info("Ejecuta la validación masiva para este taxón antes de generar su informe PDF.")
 
     st.subheader("9. Resumen operacional")
     if not row_compat.empty:
