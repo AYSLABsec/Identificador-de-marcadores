@@ -15,6 +15,16 @@ if errorlevel 1 goto :NO_WSL
 wsl.exe --status >nul 2>nul
 if errorlevel 1 goto :WSL_NOT_READY
 
+rem Si la app ya esta activa, abre el navegador y no inicia otra copia.
+curl.exe -fsS --max-time 2 http://127.0.0.1:8501/_stcore/health >nul 2>nul
+if not errorlevel 1 (
+  echo La aplicacion ya estaba ejecutandose. Abriendo el navegador...
+  start "" "http://localhost:8501"
+  echo.
+  pause
+  exit /b 0
+)
+
 for %%F in (app.py base_maestra.xlsx requirements.txt INICIAR_LINUX.sh) do (
   if not exist "%%F" (
     set "MISSING_FILE=%%F"
@@ -34,14 +44,15 @@ rem Corrige finales de linea CRLF, frecuentes cuando el .sh se copia desde Windo
 wsl.exe sed -i "s/\r$//" "%WSL_SCRIPT%"
 if errorlevel 1 goto :LINE_ENDING_ERROR
 
-rem Abre el navegador solo cuando Streamlit responde.
-start "" /b powershell.exe -NoProfile -WindowStyle Hidden -Command "$deadline=(Get-Date).AddMinutes(5); while((Get-Date) -lt $deadline){ try { $r=Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:8501/_stcore/health' -TimeoutSec 2; if($r.StatusCode -eq 200){ Start-Process 'http://localhost:8501'; exit 0 } } catch {}; Start-Sleep -Milliseconds 700 }; exit 1"
-
 echo Iniciando INICIAR_LINUX.sh dentro de WSL...
 echo No cierres esta ventana mientras uses la aplicacion.
+echo El navegador se abrira automaticamente en aproximadamente 15 segundos.
 echo.
 
-rem Se entrega la ruta como argumento directo. No usa bash -lc ni comillas escapadas.
+rem Apertura simple e independiente: no consulta Streamlit ni puede detener WSL.
+start "" /b powershell.exe -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 15; Start-Process 'http://localhost:8501'"
+
+rem La salida queda visible; no se comparte ningun archivo de registro.
 wsl.exe bash "%WSL_SCRIPT%"
 set "APP_EXIT=%ERRORLEVEL%"
 
@@ -50,7 +61,7 @@ if "%APP_EXIT%"=="0" (
   echo La aplicacion termino normalmente.
 ) else (
   echo ERROR: La aplicacion termino con codigo %APP_EXIT%.
-  echo Copia o toma una foto de todo el mensaje mostrado sobre esta linea.
+  echo Copia o toma una foto del mensaje mostrado sobre esta linea.
 )
 echo.
 pause
